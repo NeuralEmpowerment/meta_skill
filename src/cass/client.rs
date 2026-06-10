@@ -328,6 +328,16 @@ fn session_id_from_path(path: &str) -> String {
 /// turn missing `message`) is filtered out.
 fn translate_cass_record(record: &serde_json::Value) -> Option<SessionMessage> {
     let kind = record.get("type").and_then(|v| v.as_str())?;
+    // Provider dispatch. Claude Code JSONL keys conversation turns on
+    // `type: user|assistant` with a sibling `message` object. Codex JSONL
+    // (model_provider=openai, originator=codex-tui) wraps everything in a
+    // `payload` object keyed by `type: session_meta|event_msg|response_item`;
+    // its conversational content lives under `response_item`. Detect the Codex
+    // shape (a `payload` object present) and route there first; otherwise fall
+    // through to the Claude path.
+    if record.get("payload").map(|p| p.is_object()).unwrap_or(false) {
+        return translate_codex_record(kind, record.get("payload")?);
+    }
     if kind != "user" && kind != "assistant" {
         return None;
     }
@@ -355,6 +365,125 @@ fn translate_cass_record(record: &serde_json::Value) -> Option<SessionMessage> {
             }
         }
         _ => {}
+    }
+
+    Some(SessionMessage {
+        index: 0,
+        role,
+        content,
+        tool_calls,
+        tool_results,
+    })
+}
+
+/// Translate one Codex CLI export record into a `SessionMessage`.
+///
+/// Codex (OpenAI) sessions exported by cass are the raw rollout JSONL: each
+/// line is `{timestamp, type, payload}` where `type` is one of `session_meta`,
+/// `event_msg`, `turn_context`, `compacted`, or `response_item`. Only
+/// `response_item` carries conversation content, and unlike Claude (where one
+/// turn bundles text + tool blocks) Codex emits each piece as its own record:
+///
+/// - `payload.type == "message"`: `{role, content:[{type:"input_text"|"output_text", text}]}`
+/// - `payload.type == "function_call"`: `{name, arguments(JSON string), call_id}`
+/// - `payload.type == "custom_tool_call"`: `{name, input, call_id}` (e.g. apply_patch)
+/// - `payload.type == "function_call_output"` / `"custom_tool_call_output"`:
+///   `{call_id, output}`
+/// - `payload.type == "reasoning"`: chain-of-thought, dropped (parity with the
+///   Claude `thinking` block).
+///
+/// Each maps to a single `SessionMessage` so the downstream miner sees the same
+/// flat shape it gets from Claude sessions.
+fn translate_codex_record(
+    outer_type: &str,
+    payload: &serde_json::Value,
+) -> Option<SessionMessage> {
+    if outer_type != "response_item" {
+        return None;
+    }
+    let payload = payload.as_object()?;
+    let ptype = payload.get("type").and_then(|v| v.as_str())?;
+
+    let mut content = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut tool_results: Vec<ToolResult> = Vec::new();
+
+    let role = match ptype {
+        "message" => {
+            let role = payload
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("assistant")
+                .to_string();
+            if let Some(blocks) = payload.get("content").and_then(|v| v.as_array()) {
+                for block in blocks {
+                    // Both input_text (user/developer) and output_text
+                    // (assistant) carry a flat `text` field.
+                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(text);
+                    }
+                }
+            } else if let Some(s) = payload.get("content").and_then(|v| v.as_str()) {
+                content.push_str(s);
+            }
+            role
+        }
+        "function_call" | "custom_tool_call" => {
+            let id = payload
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let name = payload
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            // function_call carries `arguments` as a JSON string; custom_tool_call
+            // carries `input` as a (possibly non-JSON) string. Parse JSON when we
+            // can so downstream consumers get structured args, else preserve the
+            // raw string as a JSON string value.
+            let raw = payload
+                .get("arguments")
+                .or_else(|| payload.get("input"));
+            let arguments = match raw {
+                Some(serde_json::Value::String(s)) => serde_json::from_str(s)
+                    .unwrap_or_else(|_| serde_json::Value::String(s.clone())),
+                Some(other) => other.clone(),
+                None => serde_json::Value::Null,
+            };
+            tool_calls.push(ToolCall { id, name, arguments });
+            "assistant".to_string()
+        }
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
+            let tool_call_id = payload
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let content_str = match payload.get("output") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(other) => stringify_tool_result_content(other),
+                None => String::new(),
+            };
+            tool_results.push(ToolResult {
+                tool_call_id,
+                content: content_str,
+                is_error: false,
+            });
+            "tool".to_string()
+        }
+        // reasoning (chain-of-thought) and tool_search_call carry no
+        // skill-relevant content; drop them.
+        _ => return None,
+    };
+
+    // Drop records that produced nothing actionable.
+    if content.is_empty() && tool_calls.is_empty() && tool_results.is_empty() {
+        return None;
     }
 
     Some(SessionMessage {
@@ -833,5 +962,109 @@ mod tests {
     fn test_error_classification_generic() {
         let err = classify_cass_error(42, "Unknown error");
         assert!(matches!(err, MsError::CassUnavailable(_)));
+    }
+
+    #[test]
+    fn test_translate_claude_assistant_message() {
+        // Claude Code shape: type=assistant with sibling message.content blocks.
+        let rec = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hello"}]
+            }
+        });
+        let m = translate_cass_record(&rec).expect("claude turn should translate");
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.content, "hello");
+    }
+
+    #[test]
+    fn test_translate_codex_message() {
+        // Codex shape: payload wrapper, response_item / message / output_text.
+        let rec = serde_json::json!({
+            "timestamp": "2026-06-09T02:45:15.277Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Understood."}]
+            }
+        });
+        let m = translate_cass_record(&rec).expect("codex message should translate");
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.content, "Understood.");
+        assert!(m.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_translate_codex_function_call_parses_arguments() {
+        let rec = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"pwd && git status\"}",
+                "call_id": "call_abc"
+            }
+        });
+        let m = translate_cass_record(&rec).expect("codex function_call should translate");
+        assert_eq!(m.tool_calls.len(), 1);
+        assert_eq!(m.tool_calls[0].name, "exec_command");
+        assert_eq!(m.tool_calls[0].id, "call_abc");
+        // arguments JSON string is parsed into structured JSON.
+        assert_eq!(
+            m.tool_calls[0].arguments.get("cmd").and_then(|v| v.as_str()),
+            Some("pwd && git status")
+        );
+    }
+
+    #[test]
+    fn test_translate_codex_function_call_output() {
+        let rec = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": "Process exited with code 0\nOutput:\n/home/ubuntu"
+            }
+        });
+        let m = translate_cass_record(&rec).expect("codex output should translate");
+        assert_eq!(m.role, "tool");
+        assert_eq!(m.tool_results.len(), 1);
+        assert_eq!(m.tool_results[0].tool_call_id, "call_abc");
+        assert!(m.tool_results[0].content.contains("exited with code 0"));
+    }
+
+    #[test]
+    fn test_translate_codex_custom_tool_call_apply_patch() {
+        let rec = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "status": "completed",
+                "call_id": "call_xyz",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Update File: APSS.yaml"
+            }
+        });
+        let m = translate_cass_record(&rec).expect("custom_tool_call should translate");
+        assert_eq!(m.tool_calls.len(), 1);
+        assert_eq!(m.tool_calls[0].name, "apply_patch");
+        // Non-JSON input is preserved as a string Value.
+        assert!(m.tool_calls[0].arguments.as_str().unwrap_or_default().contains("Begin Patch"));
+    }
+
+    #[test]
+    fn test_translate_codex_reasoning_dropped() {
+        // Chain-of-thought is dropped (parity with Claude `thinking`).
+        let rec = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "x"}]}
+        });
+        assert!(translate_cass_record(&rec).is_none());
+        // Non-conversational wrappers are dropped too.
+        let meta = serde_json::json!({"type": "session_meta", "payload": {"id": "abc"}});
+        assert!(translate_cass_record(&meta).is_none());
     }
 }
