@@ -468,6 +468,12 @@ pub struct BuildArgs {
     /// Resolve pending uncertainties
     #[arg(long)]
     pub resolve_uncertainties: bool,
+
+    /// After writing SKILL.md in --auto, index it into the ms store so it
+    /// appears in `ms list`. Opt-in to avoid surprising the store with
+    /// candidate (un-reviewed) skills.
+    #[arg(long)]
+    pub register: bool,
 }
 
 /// CM integration context for build process.
@@ -964,25 +970,151 @@ fn synthesize_draft_from_patterns(
     use crate::cass::brenner::{BrennerSkillDraft, SkillRule};
     use crate::cass::mining::PatternType;
 
-    let kind_label = |p: &crate::cass::mining::ExtractedPattern| -> &'static str {
+    // Stored `description` values are frequently generic placeholders set at
+    // extraction time (e.g. "Command sequence extracted from session"). Treat
+    // those as empty so we can mint a specific rule line from the typed
+    // pattern data instead.
+    let is_generic_placeholder = |d: &str| -> bool {
+        let d = d.trim();
+        d.is_empty()
+            || d == "Command sequence extracted from session"
+            || d == "Workflow pattern extracted from session phases"
+            || d == "Error handling pattern from session"
+            || d == "Code pattern extracted from session"
+            // Auto-generated placeholders from generate_pattern_description():
+            || d.starts_with("Code pattern in")
+            || d.starts_with("Command sequence with")
+            || d.starts_with("Workflow with")
+            || d.starts_with("Error handling for")
+            || d == "Decision tree pattern"
+    };
+
+    // Build a meaningful, type-aware rule line straight from the pattern data.
+    let describe_pattern = |p: &crate::cass::mining::ExtractedPattern| -> String {
+        let join_trunc = |items: &[String], n: usize| -> String {
+            let taken: Vec<String> = items
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .take(n)
+                .cloned()
+                .collect();
+            let more = items.len().saturating_sub(taken.len());
+            let mut s = taken.join(" -> ");
+            if more > 0 {
+                s.push_str(&format!(" (+{more} more)"));
+            }
+            s
+        };
         match &p.pattern_type {
-            PatternType::CommandPattern { .. } => "command sequence",
-            PatternType::CodePattern { .. } => "code idiom",
-            PatternType::WorkflowPattern { .. } => "workflow",
-            PatternType::DecisionPattern { .. } => "decision",
-            PatternType::ErrorPattern { .. } => "error handling",
-            PatternType::RefactorPattern { .. } => "refactor",
-            PatternType::ConfigPattern { .. } => "configuration",
-            PatternType::ToolPattern { .. } => "tool usage",
+            PatternType::CommandPattern { commands, frequency, contexts } => {
+                let seq = join_trunc(commands, 5);
+                let ctx = contexts.iter().find(|c| !c.trim().is_empty());
+                match ctx {
+                    Some(c) => format!(
+                        "Run this command sequence (seen {frequency}x in {c}): {seq}"
+                    ),
+                    None => format!("Run this command sequence (seen {frequency}x): {seq}"),
+                }
+            }
+            PatternType::CodePattern { language, code, purpose, frequency } => {
+                let p = purpose.trim();
+                let lang = if language.trim().is_empty() { "code" } else { language.as_str() };
+                if !p.is_empty() {
+                    format!("Use this {lang} idiom to {p} (seen {frequency}x)")
+                } else {
+                    // No purpose recorded: summarize from the first code line.
+                    let first = code
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect::<String>();
+                    if first.is_empty() {
+                        format!("Reusable {lang} idiom (seen {frequency}x)")
+                    } else {
+                        format!("Reusable {lang} idiom (seen {frequency}x): {first}")
+                    }
+                }
+            }
+            PatternType::WorkflowPattern { steps, triggers, outcomes } => {
+                let step_lines: Vec<String> = steps
+                    .iter()
+                    .map(|s| {
+                        let d = s.description.trim();
+                        if d.is_empty() { s.action.clone() } else { d.to_string() }
+                    })
+                    .collect();
+                let mut line = format!("Workflow: {}", join_trunc(&step_lines, 6));
+                if let Some(t) = triggers.iter().find(|t| !t.trim().is_empty()) {
+                    line = format!("When {t}, follow this workflow: {}", join_trunc(&step_lines, 6));
+                }
+                if let Some(o) = outcomes.iter().find(|o| !o.trim().is_empty()) {
+                    line.push_str(&format!(" (outcome: {o})"));
+                }
+                line
+            }
+            PatternType::DecisionPattern { condition, branches, default_action } => {
+                let branch_lines: Vec<String> = branches
+                    .iter()
+                    .map(|b| format!("if {} -> {}", b.condition, b.action))
+                    .collect();
+                let mut line = format!(
+                    "Decision on {condition}: {}",
+                    join_trunc(&branch_lines, 4)
+                );
+                if let Some(d) = default_action {
+                    line.push_str(&format!("; otherwise {d}"));
+                }
+                line
+            }
+            PatternType::ErrorPattern { error_type, symptoms, resolution_steps, prevention } => {
+                let sym = symptoms.iter().find(|s| !s.trim().is_empty());
+                let res = join_trunc(resolution_steps, 4);
+                let mut line = match sym {
+                    Some(s) => format!("Error \"{error_type}\" (symptom: {s}) -> resolve by: {res}"),
+                    None => format!("Error \"{error_type}\" -> resolve by: {res}"),
+                };
+                if let Some(prev) = prevention {
+                    line.push_str(&format!("; prevent via {prev}"));
+                }
+                line
+            }
+            PatternType::RefactorPattern { before_pattern, after_pattern, rationale, .. } => {
+                format!(
+                    "Refactor: {before_pattern} -> {after_pattern} ({rationale})"
+                )
+            }
+            PatternType::ConfigPattern { config_type, settings, context } => {
+                let kv: Vec<String> = settings
+                    .iter()
+                    .map(|s| format!("{}={}", s.key, s.value))
+                    .collect();
+                format!(
+                    "Configure {config_type} ({context}): {}",
+                    join_trunc(&kv, 5)
+                )
+            }
+            PatternType::ToolPattern { tool_name, common_args, use_cases } => {
+                let args = join_trunc(common_args, 4);
+                match use_cases.iter().find(|u| !u.trim().is_empty()) {
+                    Some(u) => format!("Use `{tool_name}` for {u} (common args: {args})"),
+                    None => format!("Use `{tool_name}` (common args: {args})"),
+                }
+            }
         }
     };
 
     let rules: Vec<SkillRule> = patterns
         .iter()
         .map(|p| {
-            let description = p.description.clone().unwrap_or_else(|| {
-                format!("{} pattern observed {}x", kind_label(p), p.frequency.max(1))
-            });
+            // Prefer a non-placeholder stored description; otherwise mint one
+            // from the typed pattern data so the rule line is specific.
+            let description = match &p.description {
+                Some(d) if !is_generic_placeholder(d) => d.clone(),
+                _ => describe_pattern(p),
+            };
             let evidence: Vec<String> = p
                 .evidence
                 .iter()
@@ -1433,6 +1565,33 @@ fn run_auto(
 
     if ctx.output_format == OutputFormat::Human {
         println!("  Skill: {}", skill_path.display());
+    }
+
+    // Optional auto-registration: index the freshly written SKILL.md into the
+    // ms store so `ms list` surfaces it. Gated behind --register because these
+    // are candidate skills synthesized without human review; we never want to
+    // silently flood the store on every build. Re-indexing is idempotent
+    // (keyed by skill path), so this is safe to re-run.
+    if args.register {
+        if ctx.output_format == OutputFormat::Human {
+            println!("  Registering skill into ms store via index...");
+        }
+        let index_args = crate::cli::commands::index::IndexArgs {
+            paths: vec![output_dir.to_string_lossy().to_string()],
+            watch: false,
+            force: true,
+            all: false,
+            from_ru: false,
+        };
+        if let Err(e) = crate::cli::commands::index::run(ctx, &index_args) {
+            // Non-fatal: the build itself succeeded; registration is a
+            // convenience. Surface the failure but do not abort.
+            if ctx.output_format == OutputFormat::Human {
+                println!("  Warning: skill registration failed: {e}");
+            }
+        } else if ctx.output_format == OutputFormat::Human {
+            println!("  Registered. `ms list` should now show \"{skill_name}\".");
+        }
     }
 
     session.phase_progress = 1.0;
