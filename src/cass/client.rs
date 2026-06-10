@@ -102,13 +102,22 @@ impl CassClient {
 
     /// Fetch a full session by its file path.
     ///
-    /// cass 0.6.x removed `cass show`; the conversation body is now obtained via
-    /// `cass export <path> --format json`, which returns a JSON array of messages.
+    /// cass 0.6.x `export --format json` emits the raw Claude Code JSONL stream
+    /// as a JSON array of heterogeneous records keyed on `type` (user, assistant,
+    /// system, mode, attachment, ...). Conversation turns carry the payload under
+    /// `message.{role,content}`, where `content` is either a string or an array
+    /// of typed blocks (text, thinking, tool_use, tool_result). Translate that
+    /// shape into the flat `SessionMessage` the rest of ms consumes.
     pub fn get_session(&self, session_path: &str) -> Result<Session> {
         let output = self.run_command(&["export", session_path, "--format", "json"])?;
-        let mut messages: Vec<SessionMessage> = serde_json::from_slice(&output).map_err(|e| {
-            MsError::CassUnavailable(format!("Failed to parse session export: {e}"))
-        })?;
+        let records: Vec<serde_json::Value> =
+            serde_json::from_slice(&output).map_err(|e| {
+                MsError::CassUnavailable(format!("Failed to parse session export: {e}"))
+            })?;
+        let mut messages: Vec<SessionMessage> = records
+            .iter()
+            .filter_map(translate_cass_record)
+            .collect();
         // cass export does not emit a per-message index; assign positional indices
         // so downstream consumers that key on `SessionMessage::index`
         // (e.g. mining taint tracking) get stable, distinct values.
@@ -308,6 +317,159 @@ fn session_id_from_path(path: &str) -> String {
         .file_stem()
         .and_then(|s| s.to_str())
         .map_or_else(|| path.to_string(), str::to_string)
+}
+
+/// Translate one cass 0.6.x export record into a `SessionMessage`.
+///
+/// cass 0.6.x emits the raw Claude Code JSONL stream: a heterogeneous mix of
+/// `user` / `assistant` turns interleaved with `mode`, `attachment`, `system`,
+/// `file-history-snapshot`, etc. Only `user` and `assistant` records carry a
+/// `message` object whose `content` we need to flatten. Anything else (or a
+/// turn missing `message`) is filtered out.
+fn translate_cass_record(record: &serde_json::Value) -> Option<SessionMessage> {
+    let kind = record.get("type").and_then(|v| v.as_str())?;
+    if kind != "user" && kind != "assistant" {
+        return None;
+    }
+    let message = record.get("message")?.as_object()?;
+    let role = message
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or(kind)
+        .to_string();
+
+    let mut content = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut tool_results: Vec<ToolResult> = Vec::new();
+
+    match message.get("content") {
+        Some(serde_json::Value::String(s)) => content.push_str(s),
+        Some(serde_json::Value::Array(blocks)) => {
+            for block in blocks {
+                flatten_content_block(
+                    block,
+                    &mut content,
+                    &mut tool_calls,
+                    &mut tool_results,
+                );
+            }
+        }
+        _ => {}
+    }
+
+    Some(SessionMessage {
+        index: 0,
+        role,
+        content,
+        tool_calls,
+        tool_results,
+    })
+}
+
+/// Flatten one Claude Code content block onto the accumulating text + tool
+/// vectors. Unknown block types are skipped rather than fatal so future cass
+/// upgrades don't break extraction.
+fn flatten_content_block(
+    block: &serde_json::Value,
+    content: &mut String,
+    tool_calls: &mut Vec<ToolCall>,
+    tool_results: &mut Vec<ToolResult>,
+) {
+    let Some(obj) = block.as_object() else {
+        return;
+    };
+    let Some(block_type) = obj.get("type").and_then(|v| v.as_str()) else {
+        return;
+    };
+    match block_type {
+        "text" => {
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(text);
+            }
+        }
+        "thinking" => {
+            // v1: drop chain-of-thought from the extracted body.
+        }
+        "tool_use" => {
+            let id = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let name = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let arguments = obj
+                .get("input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
+        }
+        "tool_result" => {
+            let tool_call_id = obj
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let content_str = match obj.get("content") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(other) => stringify_tool_result_content(other),
+                None => String::new(),
+            };
+            let is_error = obj
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            tool_results.push(ToolResult {
+                tool_call_id,
+                content: content_str,
+                is_error,
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Render a non-string tool_result `content` value as a string.
+///
+/// Anthropic clients often emit `tool_result.content` as either a plain string
+/// or a list of typed blocks (e.g. `[{type: "text", text: "..."}]`). For the
+/// latter, concatenate the embedded `text` fields; otherwise fall back to a
+/// compact JSON encoding so downstream mining still sees the payload.
+fn stringify_tool_result_content(value: &serde_json::Value) -> String {
+    if let Some(blocks) = value.as_array() {
+        let mut out = String::new();
+        for block in blocks {
+            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            } else if block.is_string() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(block.as_str().unwrap_or_default());
+            } else {
+                let encoded = serde_json::to_string(block).unwrap_or_default();
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&encoded);
+            }
+        }
+        return out;
+    }
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 /// Fill in fields cass 0.6.x no longer emits (currently the derived `session_id`).
