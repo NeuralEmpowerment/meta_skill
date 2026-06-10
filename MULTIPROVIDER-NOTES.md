@@ -1,78 +1,33 @@
-# Multi-provider session coverage (translate_cass_record)
+# Multi-provider coverage (Task B): IMPLEMENTED, UNVALIDATED
 
-Status as of 2026-06-10. Covers what each agent provider's `cass export
---format json` records look like and how `ms` decodes them into the flat
-`SessionMessage` the miner consumes.
+Authored by the orchestrator on the code agent's behalf (the agent hit an
+upstream API rate limit and exited after writing the code but before committing
+or documenting). The code is preserved and committed here.
 
-## How it works
+## Status
+Code added + compiles + NO Claude regression (a Claude query still extracts 12
+patterns on this binary). NOT empirically validated for Codex/Gemini, because
+the cass corpus on this box is 100% Claude Code sessions (60/60 in a top-60
+search). Proving it needs a real Codex/Gemini session indexed into cass.
 
-`CassClient::get_session` runs `cass export <path> --format json` and maps each
-record through `translate_cass_record`. cass returns the provider's RAW JSONL
-(it does NOT normalize across providers), so `translate_cass_record` must
-detect and decode each provider's native shape. Dispatch is by record shape:
+## What was added (src/cass/client.rs, +233 lines)
+`translate_cass_record` now dispatches by provider record shape:
+- Claude Code (existing path): `type: user|assistant` with a sibling `message`
+  object; content is a string or block array (text/thinking/tool_use/tool_result).
+- Codex (OpenAI, originator codex-tui): records wrap content in a `payload`
+  object keyed by `type: session_meta|event_msg|response_item|turn_context|
+  compacted`. Only `response_item` carries conversation; `payload.type ==
+  "message"` -> `{role, content:[{type: input_text|output_text, text}]}`. Codex
+  emits each piece as its own record (vs Claude bundling a turn). Implemented as
+  `translate_codex_record`. This is schema-grounded, not guessed.
 
-- A record with a `payload` object -> Codex shape -> `translate_codex_record`.
-- Otherwise -> Claude Code shape (`type: user|assistant` + sibling `message`).
+## Validation gap (the real limit)
+The Codex branch is UNTESTED against real data (no Codex sessions in the index).
+Before claiming Codex support: index a Codex rollout into cass and confirm
+`ms build --from-cass ... --auto` yields patterns_extracted > 0. Gemini was not
+separately implemented in this pass; its export shape still needs inspection.
 
-## Claude Code (`~/.claude/projects/**`, agent=claude_code)
-
-- Conversation turns: `{type: "user"|"assistant", message: {role, content}}`.
-- `content` is a string OR an array of typed blocks: `text`, `thinking`
-  (dropped), `tool_use` (-> ToolCall), `tool_result` (-> ToolResult).
-- This was the original / only supported shape (wall-1).
-- Corpus: 191 of ~200 sampled hits. The dominant provider on this box.
-
-## Codex (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, agent=codex)
-
-- DIFFERENT shape. Every line is `{timestamp, type, payload}` where top-level
-  `type` is one of `session_meta`, `event_msg`, `turn_context`, `compacted`,
-  `response_item`. Only `response_item` carries conversation content.
-- `payload.type` within `response_item`:
-  - `message`: `{role, content: [{type: "input_text"|"output_text", text}]}`.
-    Roles seen: assistant (output_text), user/developer (input_text).
-  - `function_call`: `{name, arguments (JSON STRING), call_id}` -> ToolCall.
-    `arguments` is a JSON-encoded string; we parse it to structured JSON when
-    possible, else keep the raw string.
-  - `custom_tool_call`: `{name, input, call_id}` (e.g. `apply_patch`) ->
-    ToolCall. `input` is often non-JSON (patch text); preserved as a string.
-  - `function_call_output` / `custom_tool_call_output` / `tool_search_output`:
-    `{call_id, output}` -> ToolResult (role "tool").
-  - `reasoning`: chain-of-thought, DROPPED (parity with Claude `thinking`).
-  - `tool_search_call`: no skill-relevant content, dropped.
-- Unlike Claude (one turn bundles text + tool blocks), Codex emits each piece
-  as its own top-level record, so each maps to its own SessionMessage.
-- Before this change `translate_cass_record` returned None for every Codex
-  record (it only matched `type: user|assistant`), so Codex sessions yielded
-  ZERO messages and ZERO mined patterns. This was a real, silent coverage gap.
-- Corpus: 9 of ~200 sampled cass hits; 62 rollout files on disk. The two
-  cass-indexed Codex sessions happen to be short/aborted ("test 1 2",
-  interrupted turns), so the `build --from-cass` search does not reliably pick
-  them for a focused query. Decoder coverage is therefore proven by unit tests
-  against real-shape records (see `src/cass/client.rs` tests:
-  test_translate_codex_message, _function_call_parses_arguments,
-  _function_call_output, _custom_tool_call_apply_patch, _reasoning_dropped),
-  plus a Claude regression test, all green.
-
-## Gemini (`~/.gemini/**`)
-
-- NOT PRESENT in the cass corpus. `cass search` returns zero hits with
-  agent=gemini; the agent-field distribution over 200 sampled hits is
-  191 claude_code + 9 codex, 0 gemini.
-- On disk, `~/.gemini` contains settings backups plus chat transcripts under
-  `~/.gemini/tmp/<project>/chats/session-*.jsonl`. These exist but are NOT
-  indexed by cass on this box, so `cass export` cannot surface them through
-  the normal `ms build --from-cass` path.
-- Coverage decision: NOT extended. Decoding a shape that cass cannot feed us
-  would be speculative (we could not prove it against the live pipeline). This
-  is a real, documented coverage limit. When/if cass indexes Gemini sessions,
-  the same shape-dispatch pattern in `translate_cass_record` is the place to
-  add a `translate_gemini_record` branch; capture a real
-  `~/.gemini/tmp/*/chats/session-*.jsonl` record shape first, then decode.
-
-## Summary
-
-| Provider | cass-indexed | Decoder | Proof |
-|----------|--------------|---------|-------|
-| Claude Code | yes (dominant) | wall-1 | regression test + live builds |
-| Codex | yes (sparse, short) | added (this change) | 5 unit tests, real shapes |
-| Gemini | no | not added (documented) | n/a - cass has no hits |
+## Upstream relevance (#114)
+This is exactly the "scope of fix" caveat already noted in issue #114: a complete
+fix branches on provider shape. The Codex branch here is a concrete proposal but
+should be validated before it is offered upstream as proven.
