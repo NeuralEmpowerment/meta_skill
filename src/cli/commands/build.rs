@@ -950,6 +950,75 @@ fn run_guided(
 }
 
 /// Run automatic build (no user interaction)
+/// Synthesize a `BrennerSkillDraft` directly from extracted patterns (non-interactive).
+///
+/// The guided wizard normally turns human-tagged cognitive moves into rules; in
+/// `--auto` there is no human, so we map each `ExtractedPattern` straight into a
+/// `SkillRule`. Pattern `description`/evidence snippets are real mined content,
+/// so the resulting SKILL.md is substantive rather than a stub.
+fn synthesize_draft_from_patterns(
+    name: &str,
+    query: &str,
+    patterns: &[crate::cass::mining::ExtractedPattern],
+) -> crate::cass::brenner::BrennerSkillDraft {
+    use crate::cass::brenner::{BrennerSkillDraft, SkillRule};
+    use crate::cass::mining::PatternType;
+
+    let kind_label = |p: &crate::cass::mining::ExtractedPattern| -> &'static str {
+        match &p.pattern_type {
+            PatternType::CommandPattern { .. } => "command sequence",
+            PatternType::CodePattern { .. } => "code idiom",
+            PatternType::WorkflowPattern { .. } => "workflow",
+            PatternType::DecisionPattern { .. } => "decision",
+            PatternType::ErrorPattern { .. } => "error handling",
+            PatternType::RefactorPattern { .. } => "refactor",
+            PatternType::ConfigPattern { .. } => "configuration",
+            PatternType::ToolPattern { .. } => "tool usage",
+        }
+    };
+
+    let rules: Vec<SkillRule> = patterns
+        .iter()
+        .map(|p| {
+            let description = p.description.clone().unwrap_or_else(|| {
+                format!("{} pattern observed {}x", kind_label(p), p.frequency.max(1))
+            });
+            let evidence: Vec<String> = p
+                .evidence
+                .iter()
+                .filter_map(|e| e.snippet.clone())
+                .filter(|s| !s.trim().is_empty())
+                .take(3)
+                .collect();
+            SkillRule {
+                id: p.id.clone(),
+                description,
+                evidence,
+                confidence: p.confidence,
+            }
+        })
+        .collect();
+
+    let calibration = vec![format!(
+        "Auto-synthesized from {} mined pattern(s) for query \"{}\". No human review of cognitive moves was performed; treat rules as candidate guidance.",
+        rules.len(),
+        query
+    )];
+
+    BrennerSkillDraft {
+        name: name.to_string(),
+        description: format!(
+            "Skill auto-synthesized via the Brenner method from cass sessions matching: {query}"
+        ),
+        rules,
+        examples: Vec::new(),
+        avoid_when: Vec::new(),
+        calibration,
+        validation: None,
+    }
+}
+
+
 fn run_auto(
     ctx: &AppContext,
     args: &BuildArgs,
@@ -1352,6 +1421,20 @@ fn run_auto(
     let manifest_path = output_dir.join("build-manifest.json");
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
 
+    // Synthesize a SKILL.md non-interactively from the mined patterns.
+    let skill_name = args
+        .name
+        .clone()
+        .unwrap_or_else(|| query.clone());
+    let draft = synthesize_draft_from_patterns(&skill_name, &query, &filtered_patterns);
+    let skill_md = generate_skill_md(&draft);
+    let skill_path = output_dir.join("SKILL.md");
+    fs::write(&skill_path, &skill_md)?;
+
+    if ctx.output_format == OutputFormat::Human {
+        println!("  Skill: {}", skill_path.display());
+    }
+
     session.phase_progress = 1.0;
     session.advance_phase(); // -> Complete
 
@@ -1387,6 +1470,7 @@ fn run_auto(
             "output_dir": output_dir.display().to_string(),
             "patterns_path": patterns_path.display().to_string(),
             "manifest_path": manifest_path.display().to_string(),
+            "skill_path": skill_path.display().to_string(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
